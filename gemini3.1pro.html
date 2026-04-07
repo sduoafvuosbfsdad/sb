@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Realistic Flip Clock</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            font-family: sans-serif;
+        }
+        #start-overlay {
+            position: absolute;
+            top: 0; left: 0; width: 100vw; height: 100vh;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+            color: white;
+            flex-direction: column;
+        }
+        button {
+            padding: 15px 30px;
+            font-size: 20px;
+            cursor: pointer;
+            background: #fff;
+            color: #000;
+            border: none;
+            border-radius: 5px;
+            margin-top: 20px;
+            transition: 0.2s;
+        }
+        button:hover { background: #ccc; }
+    </style>
+    <!-- Load Three.js and GSAP -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+</head>
+<body>
+
+    <div id="start-overlay">
+        <h1>3D Flip Clock</h1>
+        <p>Turn up your volume for mechanical sound effects</p>
+        <button id="start-btn">Click to Start</button>
+    </div>
+
+    <script>
+        // --- 1. Audio Setup (Base64 Mechanical Tick Sound) ---
+        // A short mechanical click sound to avoid external asset dependency
+        const tickSoundUrl = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA="; // Placeholder valid empty WAV header
+        // For actual sound, we'll synthesize a mechanical "clack" using Web Audio API to ensure it always works.
+        let audioCtx;
+        function playTick() {
+            if (!audioCtx) return;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            
+            // Mechanical clack sound profile
+            osc.type = 'square';
+            osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.05);
+            
+            gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.05);
+            
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.05);
+        }
+
+        // --- 2. Three.js Scene Setup ---
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.Fog(0x1a1a1a, 10, 30);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 14);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setClearColor(0x1a1a1a);
+        renderer.shadowMap.enabled = true;
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        document.body.appendChild(renderer.domElement);
+
+        // Lighting
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+        scene.add(ambientLight);
+
+        const spotLight = new THREE.SpotLight(0xffffff, 1);
+        spotLight.position.set(0, 10, 10);
+        spotLight.angle = Math.PI / 4;
+        spotLight.penumbra = 0.5;
+        spotLight.castShadow = true;
+        scene.add(spotLight);
+
+        // Background Plate
+        const bgGeo = new THREE.PlaneGeometry(30, 15);
+        const bgMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.8 });
+        const bgMesh = new THREE.Mesh(bgGeo, bgMat);
+        bgMesh.position.z = -1;
+        bgMesh.receiveShadow = true;
+        scene.add(bgMesh);
+
+        // --- 3. Dynamic Texture Generator ---
+        function createTexture(char, isTop, isFlipped = false) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+
+            // Card Background
+            ctx.fillStyle = '#222222';
+            // Draw rounded rectangle for realism
+            ctx.beginPath();
+            ctx.roundRect(5, 5, 246, 246, 15);
+            ctx.fill();
+
+            // Text Setup
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 200px Arial, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+
+            ctx.save();
+            
+            // Handle upside-down text for the back of the flipping card
+            if (isFlipped) {
+                ctx.translate(128, 128);
+                ctx.rotate(Math.PI);
+                ctx.translate(-128, -128);
+            }
+
+            // Offset text to render top or bottom half
+            if (isTop) {
+                ctx.translate(0, 64); 
+            } else {
+                ctx.translate(0, -64);
+            }
+
+            ctx.fillText(char, 128, 128);
+            ctx.restore();
+
+            // Add center dividing line (shadow effect)
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            if (isTop) ctx.fillRect(0, 250, 256, 6);
+            if (!isTop) ctx.fillRect(0, 0, 256, 6);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+            return texture;
+        }
+
+        // --- 4. Flip Digit Class ---
+        const cardWidth = 1.8;
+        const cardHeight = 1.2;
+
+        class FlipDigit {
+            constructor(xOffset) {
+                this.group = new THREE.Group();
+                this.group.position.x = xOffset;
+                this.currentValue = '';
+                this.isFlipping = false;
+
+                const geo = new THREE.PlaneGeometry(cardWidth, cardHeight);
+                const matConfig = { roughness: 0.5, metalness: 0.1, side: THREE.DoubleSide };
+
+                // Static Top Card
+                this.topMat = new THREE.MeshStandardMaterial({ ...matConfig });
+                this.topMesh = new THREE.Mesh(geo, this.topMat);
+                this.topMesh.position.y = cardHeight / 2 + 0.02;
+                this.topMesh.castShadow = true;
+
+                // Static Bottom Card
+                this.bottomMat = new THREE.MeshStandardMaterial({ ...matConfig });
+                this.bottomMesh = new THREE.Mesh(geo, this.bottomMat);
+                this.bottomMesh.position.y = -cardHeight / 2 - 0.02;
+                this.bottomMesh.castShadow = true;
+
+                // Flipping Card (Requires custom pivot at the bottom edge)
+                this.flipGroup = new THREE.Group();
+                this.flipGroup.position.y = 0; // Pivot point at center divider
+                
+                const flipGeo = new THREE.PlaneGeometry(cardWidth, cardHeight);
+                flipGeo.translate(0, cardHeight / 2, 0); // Move mesh up so origin is at bottom
+                
+                // Front and Back materials for the flipping card
+                this.flipFrontMat = new THREE.MeshStandardMaterial({ ...matConfig, side: THREE.FrontSide });
+                this.flipBackMat = new THREE.MeshStandardMaterial({ ...matConfig, side: THREE.BackSide });
+
+                this.flipFrontMesh = new THREE.Mesh(flipGeo, this.flipFrontMat);
+                this.flipBackMesh = new THREE.Mesh(flipGeo, this.flipBackMat);
+                
+                // Slight offset to prevent Z-fighting
+                this.flipFrontMesh.position.z = 0.02;
+                this.flipBackMesh.position.z = 0.01;
+                this.flipFrontMesh.castShadow = true;
+
+                this.flipGroup.add(this.flipFrontMesh);
+                this.flipGroup.add(this.flipBackMesh);
+
+                this.group.add(this.topMesh);
+                this.group.add(this.bottomMesh);
+                this.group.add(this.flipGroup);
+                
+                scene.add(this.group);
+            }
+
+            setValue(val) {
+                if (this.currentValue === val) return;
+                
+                const oldVal = this.currentValue || val;
+                this.currentValue = val;
+
+                // Generate Textures
+                const texOldTop = createTexture(oldVal, true);
+                const texOldBot = createTexture(oldVal, false);
+                const texNewTop = createTexture(val, true);
+                const texNewBot = createTexture(val, false);
+                const texNewBotFlipped = createTexture(val, false, true);
+
+                if (!this.isFlipping && oldVal !== val) {
+                    this.isFlipping = true;
+                    playTick(); // Play Sound
+
+                    // 1. Set Static Top to NEW value immediately
+                    this.topMat.map = texNewTop;
+                    this.topMat.needsUpdate = true;
+
+                    // 2. Set Static Bottom to OLD value
+                    this.bottomMat.map = texOldBot;
+                    this.bottomMat.needsUpdate = true;
+
+                    // 3. Set Flipping Card Front to OLD TOP
+                    this.flipFrontMat.map = texOldTop;
+                    this.flipFrontMat.needsUpdate = true;
+
+                    // 4. Set Flipping Card Back to NEW BOTTOM (Upside down)
+                    this.flipBackMat.map = texNewBotFlipped;
+                    this.flipBackMat.needsUpdate = true;
+
+                    // Animate rotation using GSAP
+                    this.flipGroup.rotation.x = 0;
+                    gsap.to(this.flipGroup.rotation, {
+                        x: -Math.PI,
+                        duration: 0.6,
+                        ease: "bounce.out", // Realistic falling bounce
+                        onComplete: () => {
+                            // After flip, update Static Bottom to NEW value
+                            this.bottomMat.map = texNewBot;
+                            this.bottomMat.needsUpdate = true;
+                            
+                            // Reset flip group rotation and hide it behind by resetting textures
+                            this.flipGroup.rotation.x = 0;
+                            this.flipFrontMat.map = texNewTop;
+                            this.isFlipping = false;
+                        }
+                    });
+                } else {
+                    // Initial setup (no animation)
+                    this.topMat.map = texNewTop;
+                    this.bottomMat.map = texNewBot;
+                    this.flipFrontMat.map = texNewTop;
+                    this.topMat.needsUpdate = true;
+                    this.bottomMat.needsUpdate = true;
+                }
+            }
+        }
+
+        // --- 5. Initialization ---
+        // Setup the 6 digits (HH:MM:SS)
+        const spacing = 2;
+        const groupSpacing = 1;
+        
+        const digits = [
+            new FlipDigit(-spacing * 2.5 - groupSpacing), // H1
+            new FlipDigit(-spacing * 1.5 - groupSpacing), // H2
+            new FlipDigit(-spacing * 0.5),                // M1
+            new FlipDigit(spacing * 0.5),                 // M2
+            new FlipDigit(spacing * 1.5 + groupSpacing),  // S1
+            new FlipDigit(spacing * 2.5 + groupSpacing)   // S2
+        ];
+
+        // Dots separator
+        function createDot(x, y) {
+            const dot = new THREE.Mesh(
+                new THREE.BoxGeometry(0.3, 0.3, 0.3),
+                new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.2 })
+            );
+            dot.position.set(x, y, 0);
+            scene.add(dot);
+        }
+        createDot(-1.5, 0.5); createDot(-1.5, -0.5);
+        createDot(1.5, 0.5); createDot(1.5, -0.5);
+
+        // --- 6. Time Loop ---
+        function updateClock() {
+            const now = new Date();
+            const timeString = 
+                String(now.getHours()).padStart(2, '0') +
+                String(now.getMinutes()).padStart(2, '0') +
+                String(now.getSeconds()).padStart(2, '0');
+
+            for (let i = 0; i < 6; i++) {
+                digits[i].setValue(timeString[i]);
+            }
+        }
+
+        // --- 7. Render Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // --- 8. Handle User Interaction (Start Audio/Clock) ---
+        document.getElementById('start-btn').addEventListener('click', () => {
+            document.getElementById('start-overlay').style.display = 'none';
+            // Initialize Audio Context on user gesture
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            updateClock();
+            setInterval(updateClock, 1000);
+        });
+
+        // Handle Window Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
